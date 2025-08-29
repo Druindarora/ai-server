@@ -198,7 +198,6 @@ async def whisper_select(req: WhisperSelectRequest, request: Request):
     # Cas 3 : démarrage d’un nouveau chargement
     _start_async_load(req.name)
     return {"service": "whisper", "requested": req.name, "current": WHISPER_MODEL, "state": "loading"}
-
 @router.post("/transcribe", response_model=WhisperTranscribeResponse)
 async def transcribe(
     file: UploadFile = File(...),
@@ -218,34 +217,57 @@ async def transcribe(
         raise HTTPException(status_code=400, detail=f"Content-Type invalide: {file.content_type}")
 
     t0 = time.perf_counter()
-    log.info(f"transcribe: filename='{file.filename}' ctype='{file.content_type}'")
+    log.info(f"[Transcribe] start: filename='{file.filename}' ctype='{file.content_type}' "
+             f"device={DEVICE_EFF} compute={COMPUTE_EFF}")
 
-    name = file.filename or ""
-    suffix = Path(name).suffix or (mimetypes.guess_extension(file.content_type or "") or ".tmp")
+    suffix = Path(file.filename or "").suffix or (mimetypes.guess_extension(file.content_type or "") or ".tmp")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
     try:
-        segments, info = _model.transcribe(
-            tmp_path,
-            language=language,
-            beam_size=beam_size,
-            vad_filter=vad,
-            vad_parameters={"min_silence_duration_ms": 500},
-        )
+        size = os.path.getsize(tmp_path)
+        log.info(f"[Transcribe] temp file saved: {tmp_path} ({size} bytes)")
+
+        try:
+            # 🔹 Première tentative avec le modèle courant (GPU si dispo)
+            segments, info = _model.transcribe(
+                tmp_path,
+                language=language,
+                beam_size=beam_size,
+                vad_filter=vad,
+                vad_parameters={"min_silence_duration_ms": 500},
+            )
+        except Exception as e:
+            log.warning(f"[Transcribe] GPU/initial model failed ({type(e).__name__}: {e}), retrying on CPU...")
+            # 🔹 Fallback CPU
+            cpu_model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
+            segments, info = cpu_model.transcribe(
+                tmp_path,
+                language=language,
+                beam_size=beam_size,
+                vad_filter=vad,
+                vad_parameters={"min_silence_duration_ms": 500},
+            )
+
         text = "".join(s.text for s in segments).strip()
-        log.info(
-            f"transcribe done in {(time.perf_counter()-t0):.2f}s, "
-            f"duration={getattr(info,'duration',0):.2f}s, lang={getattr(info,'language','?')}"
-        )
+        log.info(f"[Transcribe] success in {(time.perf_counter()-t0):.2f}s, "
+                 f"duration={getattr(info,'duration',0):.2f}s, lang={getattr(info,'language','?')}")
+
         return {"text": text, "language": info.language, "duration": info.duration}
+
     except Exception as e:
-        log.exception(f"transcribe failed: {e}")
+        log.exception(f"[Transcribe] final failure {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=f"Erreur transcription: {e}")
+
     finally:
-        os.remove(tmp_path)
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+
+
 
 # ----- Statut (utilisé par /status global) -----
 def get_status() -> Dict[str, Any]:
